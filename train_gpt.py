@@ -1,5 +1,14 @@
 import os
 import sys
+# ----------------- CLI arguments -----------------
+import argparse
+
+parser = argparse.ArgumentParser(description="modded-nanogpt trainer")
+parser.add_argument("--lr", type=float, default=1, help="Learning rate")
+parser.add_argument("--p", type=int, default=1, help="Schatten constraint")
+# parse_known_args lets torchrun pass its own flags (like --local_rank)
+cli_args, _ = parser.parse_known_args()
+
 with open(sys.argv[0]) as f:
     code = f.read() # read the code of this file ASAP, for logging
 import uuid
@@ -115,6 +124,7 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
     where S' is diagonal with S_{ii}' ~ Uniform(0.5, 1.5), which turns out not to hurt model
     performance at all relative to UV^T, where USV^T = G is the SVD.
     """
+
     assert G.ndim >= 2 # batched Muon implementation by @scottjmaddox, and put into practice in the record by @YouJiacheng
     a, b, c = (3.4445, -4.7750,  2.0315)
     X = G
@@ -132,6 +142,22 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
     if G.size(-2) > G.size(-1):
         X = X.mT
     return X
+    # Compute the SVD of G and construct the nearest orthogonal matrix.
+    # For G = U Σ Vᵀ, the zeroth-power (orthogonal) component is U Vᵀ.
+    # torch.linalg.svd works with batched inputs, so this is fully vectorised.
+    if(G.allclose(torch.zeros_like(G))):
+        return G
+    U, S, Vh = torch.linalg.svd(G.float(), full_matrices=False)
+    # √σ
+    S_half = S.to(G.dtype) ** (1.0/(cli_args.p - 1))
+     # --- Energy‑matching scale γ  -----------------------------------
+    r = min(G.shape[-2], G.shape[-1])                     # rank
+    energy = (S_half ** cli_args.p).sum()
+    gamma = (r / energy) ** (1.0/cli_args.p)                 # scalar
+    # Reconstruct Z = U Σ½ Vᵀ
+    X = (U.to(G.dtype) * S_half.unsqueeze(-2)) @ Vh.to(G.dtype) * gamma
+    #X = U.to(G.dtype) @ Vh.to(G.dtype)
+    return X * cli_args.lr
 
 class Muon(torch.optim.Optimizer):
     """
@@ -196,7 +222,10 @@ class Muon(torch.optim.Optimizer):
                     p.mul_(1 - eff_weight_decay)
                     momentum_buffer.lerp_(grad, 1 - momentum)
                     grad = grad.lerp_(momentum_buffer, momentum)
-                    v = zeropower_via_newtonschulz5(grad.bfloat16(), 5)
+                    if p.grad.max() < 1e-10:
+                        v = grad
+                    else:
+                        v = zeropower_via_newtonschulz5(grad.bfloat16(), 5)
                     p.add_(other=v, alpha=-eff_lr)
                 idx += 1
                 all_reduce_futures.append(dist.all_gather(params_pad[base_i:base_i + world_size], params_pad[base_i + rank], async_op=True).get_future())
@@ -584,7 +613,7 @@ logfile = None
 if master_process:
     run_id = uuid.uuid4()
     os.makedirs("logs", exist_ok=True)
-    logfile = f"logs/{run_id}.txt"
+    logfile = f"logs/p_{cli_args.p}_{cli_args.lr}.txt"
     print(logfile)
 def print0(s, console=False):
     if master_process:
